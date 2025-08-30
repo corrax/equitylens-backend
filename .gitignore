@@ -1,0 +1,27 @@
+# Python build and virtual env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Node build (if you have Lambda w/ Node)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# SAM build artifacts
+.aws-sam/
+.packages/
+.build/
+*.zip
+
+# AWS SAM local files
+samconfig.toml
+
+# IDE/editor junk
+.vscode/
+.idea/
+.DS_Store
+*.swp

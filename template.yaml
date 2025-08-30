@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EquityLens e‑Sign Backend (API Gateway + Lambda + DynamoDB + S3)
+
+Globals:
+  Function:
+    Timeout: 20
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref SessionsTable
+        BUCKET_NAME: !Ref UploadBucket
+
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: equitylens-esign-api
+      StageName: v1
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowHeaders: "'*'"
+        AllowMethods: "'OPTIONS,GET,POST,PUT,DELETE'"
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TableName: equitylens-ESignSessions
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+
+  SessionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/handlers/sessions.router
+      Runtime: nodejs18.x
+      FunctionName: equitylens-sessions
+      Events:
+        CreateSession:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions
+            Method: post
+        PutFields:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/fields
+            Method: put
+        Prepare:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/prepare
+            Method: post
+        Start:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/start
+            Method: post
+        GetSession:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}
+            Method: get
+        Download:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/download
+            Method: get
+        GetSigner:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/signers/{token}
+            Method: get
+        ApproveSigner:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /sessions/{id}/signers/{token}/approve
+            Method: post
+        Limits:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /limits
+            Method: get
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref UploadBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - Statement:
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: '*'
+        - Statement:
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt SignFunction.Arn
+              - !GetAtt ConvertFunction.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SessionsTable
+          BUCKET_NAME: !Ref UploadBucket
+          SIGNER_PORTAL_URL: !Ref SignerPortalUrl
+          SENDER_EMAIL: !Ref SenderEmail
+          SIGN_FUNCTION_NAME: !Ref SignFunction
+          CONVERT_FUNCTION_NAME: !Ref ConvertFunction
+          RATE_LIMITS_TABLE: !Ref RateLimitsTable
+          RATE_LIMIT_IP_DAILY: !Ref RateLimitIpDaily
+          RATE_LIMIT_SESSION_DAILY: !Ref RateLimitSessionDaily
+
+  SignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: equitylens-sign
+      Runtime: python3.11
+      CodeUri: .
+      Handler: src/signing/app.handler
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref UploadBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SessionsTable
+          BUCKET_NAME: !Ref UploadBucket
+          SIGNER_PFX_S3_KEY: !Ref SignerPfxS3Key
+          SIGNER_PFX_PASSWORD: !Ref SignerPfxPassword
+          TSA_URL: !Ref TsaUrl
+
+  ConvertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Timeout: 60
+      MemorySize: 2048
+      Architectures: [x86_64]
+      EphemeralStorage: { Size: 2048 }
+      Events:
+        ConvertDoc:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /convert
+            Method: post
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref UploadBucket
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref UploadBucket
+          RATE_LIMITS_TABLE: !Ref RateLimitsTable
+          RATE_LIMIT_IP_DAILY: !Ref RateLimitIpDaily
+    Metadata:
+      DockerTag: 7.6-python3.12-x86_64
+      DockerContext: ./src/convert
+      Dockerfile: Dockerfile
+
+  RateLimitsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TableName: equitylens-RateLimits
+      AttributeDefinitions:
+        - AttributeName: k
+          AttributeType: S
+      KeySchema:
+        - AttributeName: k
+          KeyType: HASH
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the API Gateway endpoint
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  SignerPortalUrl:
+    Description: URL for signer portal (frontend). Set as a parameter during deploy.
+    Value: !Ref SignerPortalUrl
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: https://equitylens.app
+  UploadBucket:
+    Type: String
+    Default: equitylens-esign-uploads
+    Description: Existing S3 bucket for e-sign uploads
+  SignerPortalUrl:
+    Type: String
+    Default: https://equitylens.app
+    Description: Base URL of the signer portal (frontend), e.g., https://equitylens.app
+  SenderEmail:
+    Type: String
+    Default: no-reply@equitylens.app
+    Description: Verified SES sender email address
+  SignerPfxS3Key:
+    Type: String
+    Default: equitylens-config/signer.p12
+    Description: S3 key (in upload bucket) to the PKCS#12 signer credential
+  SignerPfxPassword:
+    Type: String
+    Default: changeit
+    Description: Password for the PKCS#12 file
+  TsaUrl:
+    Type: String
+    Default: https://freetsa.org/tsr
+    Description: RFC-3161 TSA URL for timestamping
+  RateLimitIpDaily:
+    Type: Number
+    Default: 50
+    Description: Max sessions created per IP per day
+  RateLimitSessionDaily:
+    Type: Number
+    Default: 10
+    Description: Max sessions created per sessionId per day

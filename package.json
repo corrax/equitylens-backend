@@ -1,0 +1,12 @@
+{
+  "name": "equitylens-esign-backend",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.525.0",
+    "@aws-sdk/s3-request-presigner": "^3.525.0",
+    "lambda-multipart-parser": "^1.0.1",
+    "aws-sdk": "^2.1581.0",
+    "pdf-lib": "^1.17.1"
+  }
+}
