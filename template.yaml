@@ -17,6 +17,12 @@ Resources:
     Properties:
       Name: equitylens-esign-api
       StageName: v1
+      BinaryMediaTypes:
+        - multipart/form-data
+        - application/pdf
+        - application/msword
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/octet-stream
       Cors:
         AllowOrigin: !Sub "'${AllowedOrigin}'"
         AllowHeaders: "'*'"
@@ -166,6 +172,8 @@ Resources:
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref UploadBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitsTable
       Environment:
         Variables:
           BUCKET_NAME: !Ref UploadBucket
