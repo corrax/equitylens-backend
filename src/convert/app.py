@@ -76,6 +76,59 @@ def handler(event, context):
   if not os.path.exists(SOFFICE_PATH):
     return response(501, {'message': 'LibreOffice is not installed in the container'})
 
+  # Support direct invocation with an S3 key (from SessionsFunction.prepare)
+  if isinstance(event, dict) and event.get('key'):
+    key = event['key']
+    try:
+      # Fetch source object
+      obj = s3.get_object(Bucket=BUCKET, Key=key)
+      body = obj['Body'].read()
+      content_type = obj.get('ContentType') or 'application/octet-stream'
+
+      # If already PDF, just return same key
+      if 'pdf' in content_type:
+        return response(200, {'keyPdf': key})
+
+      # Decide an input filename based on content type
+      ext = '.bin'
+      if 'officedocument.wordprocessingml.document' in content_type:
+        ext = '.docx'
+      elif content_type == 'application/msword':
+        ext = '.doc'
+      elif content_type == 'application/rtf':
+        ext = '.rtf'
+
+      with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = Path(tmpdir) / f'input{ext}'
+        with open(in_path, 'wb') as f:
+          f.write(body)
+
+        out_dir = Path(tmpdir) / 'out'
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cp = subprocess.run(
+          [SOFFICE_PATH, '--headless', '--nologo', '--norestore',
+           '--convert-to', 'pdf:writer_pdf_Export', '--outdir', str(out_dir), str(in_path)],
+          check=False, capture_output=True, text=True
+        )
+        if cp.returncode != 0:
+          return response(500, {'message': 'Conversion failed', 'stderr': cp.stderr.strip()})
+
+        pdf_path = out_dir / (in_path.stem + '.pdf')
+        if not pdf_path.exists():
+          return response(500, {'message': 'Conversion failed: PDF not produced'})
+
+        with open(pdf_path, 'rb') as f:
+          pdf_bytes = f.read()
+
+        # Store alongside original with a .pdf suffix
+        key_pdf = f"{key}.pdf" if not key.lower().endswith('.pdf') else key
+        s3.put_object(Bucket=BUCKET, Key=key_pdf, Body=pdf_bytes, ContentType='application/pdf')
+        return response(200, {'keyPdf': key_pdf})
+    except Exception as e:
+      return response(500, {'message': 'Internal server error', 'detail': str(e)})
+
+  # Default path: API Gateway multipart upload conversion
   rl = rate_limit_check(event)
   if not rl.get('ok'):
     return response(429, {'message': 'Rate limit exceeded', 'scope': rl.get('scope'), 'limit': rl.get('limit'), 'count': rl.get('count')})

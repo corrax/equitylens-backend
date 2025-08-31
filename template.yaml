@@ -104,9 +104,11 @@ Resources:
             Method: get
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref UploadBucket
+            BucketName: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
         - DynamoDBCrudPolicy:
             TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitsTable
         - Statement:
             Effect: Allow
             Action:
@@ -123,7 +125,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref SessionsTable
-          BUCKET_NAME: !Ref UploadBucket
+          BUCKET_NAME: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
           SIGNER_PORTAL_URL: !Ref SignerPortalUrl
           SENDER_EMAIL: !Ref SenderEmail
           SIGN_FUNCTION_NAME: !Ref SignFunction
@@ -143,16 +145,17 @@ Resources:
       MemorySize: 512
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref UploadBucket
+            BucketName: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
         - DynamoDBCrudPolicy:
             TableName: !Ref SessionsTable
       Environment:
         Variables:
           TABLE_NAME: !Ref SessionsTable
-          BUCKET_NAME: !Ref UploadBucket
+          BUCKET_NAME: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
           SIGNER_PFX_S3_KEY: !Ref SignerPfxS3Key
           SIGNER_PFX_PASSWORD: !Ref SignerPfxPassword
           TSA_URL: !Ref TsaUrl
+          
 
   ConvertFunction:
     Type: AWS::Serverless::Function
@@ -171,18 +174,41 @@ Resources:
             Method: post
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref UploadBucket
+            BucketName: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitsTable
       Environment:
         Variables:
-          BUCKET_NAME: !Ref UploadBucket
+          BUCKET_NAME: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
           RATE_LIMITS_TABLE: !Ref RateLimitsTable
           RATE_LIMIT_IP_DAILY: !Ref RateLimitIpDaily
     Metadata:
       DockerTag: 7.6-python3.12-x86_64
       DockerContext: ./src/convert
       Dockerfile: Dockerfile
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseManagedBucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !Ref BucketCorsOrigins
+            AllowedMethods: [PUT, GET, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: ['ETag','x-amz-request-id','x-amz-id-2']
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
 
   RateLimitsTable:
     Type: AWS::DynamoDB::Table
@@ -203,8 +229,20 @@ Outputs:
   SignerPortalUrl:
     Description: URL for signer portal (frontend). Set as a parameter during deploy.
     Value: !Ref SignerPortalUrl
+  UploadsBucketName:
+    Description: The S3 bucket used for uploads and the signer PKCS#12 (managed when ManageUploadBucket=true)
+    Value: !If [UseManagedBucket, !Ref UploadsBucket, !Ref UploadBucket]
 
 Parameters:
+  ManageUploadBucket:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true','false']
+    Description: If 'true', the stack creates and manages the uploads S3 bucket with CORS; otherwise provide an existing bucket via UploadBucket.
+  BucketCorsOrigins:
+    Type: CommaDelimitedList
+    Default: https://equitylens.app,http://localhost:5173
+    Description: Origins allowed to access the uploads bucket via browser PUT/GET.
   AllowedOrigin:
     Type: String
     Default: https://equitylens.app
@@ -223,15 +261,16 @@ Parameters:
   SignerPfxS3Key:
     Type: String
     Default: equitylens-config/signer.p12
-    Description: S3 key (in upload bucket) to the PKCS#12 signer credential
+    Description: S3 object key (within UploadBucket) of the PKCS#12 signer credential
   SignerPfxPassword:
     Type: String
-    Default: changeit
+    Default: tV7B4GW3x-osK:qm]i;)
     Description: Password for the PKCS#12 file
   TsaUrl:
     Type: String
     Default: https://freetsa.org/tsr
     Description: RFC-3161 TSA URL for timestamping
+  
   RateLimitIpDaily:
     Type: Number
     Default: 50
@@ -240,3 +279,6 @@ Parameters:
     Type: Number
     Default: 10
     Description: Max sessions created per sessionId per day
+
+Conditions:
+  UseManagedBucket: !Equals [ !Ref ManageUploadBucket, 'true' ]

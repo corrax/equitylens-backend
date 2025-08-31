@@ -79,7 +79,8 @@ async function createSession(event) {
   const sessionId = randomUUID()
   const body = JSON.parse(event.body || '{}')
   const contentType = body.contentType || 'application/octet-stream'
-  const key = `${sessionId}/original`
+  const isPdf = /pdf/i.test(contentType)
+  const key = isPdf ? `${sessionId}/original.pdf` : `${sessionId}/original`
   const url = s3.getSignedUrl('putObject', { Bucket: BUCKET, Key: key, Expires: 900, ContentType: contentType })
   await ddb.put({ TableName: TABLE, Item: { sessionId, createdAt: now, status: 'CREATED', keyOriginal: key } }).promise()
   return response(201, { sessionId, uploadUrl: url, key })
@@ -100,7 +101,8 @@ async function putFields(event) {
   await ddb.update({
     TableName: TABLE,
     Key: { sessionId: id },
-    UpdateExpression: 'SET signers = :s, fields = :f, updatedAt = :u',
+    UpdateExpression: 'SET #signers = :s, #fields = :f, updatedAt = :u',
+    ExpressionAttributeNames: { '#signers': 'signers', '#fields': 'fields' },
     ExpressionAttributeValues: { ':s': signersWithTokens, ':f': fields, ':u': new Date().toISOString() },
   }).promise()
   return response(200, { ok: true })
@@ -115,25 +117,15 @@ async function prepare(event) {
   if (!item) return response(404, { message: 'Not found' })
   let key = item.keyOriginal
   if (!key) return response(400, { message: 'No original document' })
-  // Convert DOCX/DOC to PDF if needed
+  // Enforce PDF-only here; if original is not a .pdf, check for a sibling converted PDF
   if (!/\.pdf$/i.test(key)) {
+    const pdfCandidate = `${key}.pdf`
     try {
-      const lambda = new AWS.Lambda()
-      const inv = await lambda.invoke({
-        FunctionName: process.env.CONVERT_FUNCTION_NAME,
-        InvocationType: 'RequestResponse',
-        Payload: JSON.stringify({ key })
-      }).promise()
-      const payload = inv?.Payload ? JSON.parse(inv.Payload.toString()) : null
-      if (payload && payload.statusCode === 200) {
-        const body = JSON.parse(payload.body || '{}')
-        if (body.keyPdf) key = body.keyPdf
-      } else {
-        return response(payload?.statusCode || 500, { message: 'Conversion failed', detail: payload?.body })
-      }
+      // Ensure the converted PDF exists
+      await s3.headObject({ Bucket: BUCKET, Key: pdfCandidate }).promise()
+      key = pdfCandidate
     } catch (e) {
-      console.error('Conversion invoke failed', e)
-      return response(500, { message: 'Conversion failed', detail: e.message })
+      return response(400, { message: 'Original is not PDF. Please convert client-side and upload as PDF.' })
     }
   }
   // Fetch PDF
@@ -158,7 +150,8 @@ async function prepare(event) {
   await ddb.update({
     TableName: TABLE,
     Key: { sessionId: id },
-    UpdateExpression: 'SET status = :st, keyPrepared = :kp, updatedAt = :u',
+    UpdateExpression: 'SET #status = :st, keyPrepared = :kp, updatedAt = :u',
+    ExpressionAttributeNames: { '#status': 'status' },
     ExpressionAttributeValues: { ':st': 'PREPARED', ':kp': keyPrepared, ':u': new Date().toISOString() },
   }).promise()
   const getUrl = s3.getSignedUrl('getObject', { Bucket: BUCKET, Key: keyPrepared, Expires: 900 })
@@ -175,9 +168,11 @@ async function start(event) {
   const item = get?.Item
   if (!item) return response(404, { message: 'Not found' })
   const signers = item.signers || []
+  const invites = []
   for (const s of signers) {
     if (!s?.email || !s?.token) continue
     const link = `${portal.replace(/\/$/,'')}/#/sign/${encodeURIComponent(id)}/${encodeURIComponent(s.token)}`
+    invites.push({ email: s.email, name: s.name || '', link })
     try {
       await ses.sendEmail({
         Source: sender,
@@ -197,10 +192,11 @@ async function start(event) {
   await ddb.update({
     TableName: TABLE,
     Key: { sessionId: id },
-    UpdateExpression: 'SET status = :st, updatedAt = :u',
+    UpdateExpression: 'SET #status = :st, updatedAt = :u',
+    ExpressionAttributeNames: { '#status': 'status' },
     ExpressionAttributeValues: { ':st': 'IN_PROGRESS', ':u': new Date().toISOString() },
   }).promise()
-  return response(202, { ok: true })
+  return response(202, { ok: true, invites, emailAttempted: true })
 }
 
 async function getSession(event) {
@@ -239,6 +235,8 @@ async function getSigner(event) {
 async function approveSigner(event) {
   const { id, token } = event.pathParameters || {}
   if (!id || !token) return response(400, { message: 'Missing params' })
+  const ip = getIp(event)
+  const ua = (event.headers && (event.headers['user-agent'] || event.headers['User-Agent'])) || ''
   const res = await ddb.get({ TableName: TABLE, Key: { sessionId: id } }).promise()
   const item = res?.Item
   if (!item) return response(404, { message: 'Not found' })
@@ -247,11 +245,21 @@ async function approveSigner(event) {
   if (idx === -1) return response(404, { message: 'Invalid token' })
   signers[idx].status = 'APPROVED'
   signers[idx].approvedAt = new Date().toISOString()
+  signers[idx].approvedIp = ip
+  signers[idx].approvedUserAgent = ua
+  const events = Array.isArray(item.events) ? item.events : []
+  events.push({
+    type: 'SIGNER_APPROVED',
+    signerId: signers[idx].id,
+    at: new Date().toISOString(),
+    ip,
+    userAgent: ua
+  })
   await ddb.update({
     TableName: TABLE,
     Key: { sessionId: id },
-    UpdateExpression: 'SET signers = :s, updatedAt = :u',
-    ExpressionAttributeValues: { ':s': signers, ':u': new Date().toISOString() }
+    UpdateExpression: 'SET signers = :s, events = :e, updatedAt = :u',
+    ExpressionAttributeValues: { ':s': signers, ':e': events, ':u': new Date().toISOString() }
   }).promise()
   // If all signers approved, trigger signing function
   const allApproved = signers.length > 0 && signers.every(s => s.status === 'APPROVED')

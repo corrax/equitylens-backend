@@ -1,2 +1,2 @@
-# Add Python dependencies here
-# e.g., pyhanko
+pyhanko
+pyhanko-aws-kms-pkcs11
